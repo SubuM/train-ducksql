@@ -5,6 +5,7 @@ import duckdb
 import os
 import re
 
+
 # -------------------------------
 # Config
 # -------------------------------
@@ -143,20 +144,27 @@ if st.session_state["token"]:
 
         with tabs[1]:
             st.write("Delete a user:")
+
             users = get_all_users()
+            users = [u for u in users if u != "admin"]
+
             if users:
-                user_to_delete = st.selectbox("Select user", [u for u in users if u != "admin"])
+                user_to_delete = st.selectbox("Select user", users)
+                confirm = st.checkbox(f"Confirm delete `{user_to_delete}`")
+
                 if st.button("Delete User"):
-                    if user_to_delete:
-                        confirm = st.checkbox(f"Confirm delete `{user_to_delete}`")
-                        if confirm:
-                            try:
-                                os.remove(get_user_db_path(user_to_delete))
-                                st.success(f"User `{user_to_delete}` deleted successfully!")
-                            except Exception as e:
-                                st.error(f"Error deleting user: {str(e)}")
+                    if confirm:
+                        try:
+                            os.remove(get_user_db_path(user_to_delete))
+                            st.success(f"User `{user_to_delete}` deleted successfully!")
+                            st.rerun()  # 🔥 Force refresh so user list updates
+                        except Exception as e:
+                            st.error(f"Error deleting user: {str(e)}")
+                    else:
+                        st.warning("Please confirm deletion first.")
             else:
                 st.info("No users found.")
+
 
         with tabs[2]:
             st.write("Execute SQL on admin database:")
