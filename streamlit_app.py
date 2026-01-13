@@ -6,12 +6,11 @@ import os
 import re
 
 # -------------------------------
-# Config
+# Config & Secrets
 # -------------------------------
-# REMOVED: DB_FOLDER configuration (no longer needed)
 TABLE_PREVIEW_LIMIT = 20
 
-# 1. Validation for Secrets
+# Check for secrets
 if 'motherduck_token' not in st.secrets:
     st.error("🚨 Missing 'motherduck_token' in secrets.")
     st.stop()
@@ -19,11 +18,10 @@ if 'motherduck_token' not in st.secrets:
 ADMIN_TOKEN = st.secrets.get("ADMIN_TOKEN", "changeme")
 
 # -------------------------------
-# Helpers (MotherDuck Implementation)
+# Backend Helpers (MotherDuck)
 # -------------------------------
 
 def get_connection():
-    """Connects to MotherDuck using the secret token."""
     token = st.secrets['motherduck_token']
     return duckdb.connect(f"md:?motherduck_token={token}")
 
@@ -31,7 +29,7 @@ def init_db():
     conn = get_connection()
     try:
         conn.execute("CREATE SCHEMA IF NOT EXISTS system_app;")
-        # We add 'DEFAULT CURRENT_TIMESTAMP' to the created_at column
+        # Auto-timestamp added
         conn.execute("""
             CREATE TABLE IF NOT EXISTS system_app.users (
                 username VARCHAR PRIMARY KEY, 
@@ -47,19 +45,17 @@ def init_db():
 def register_user(username, password):
     conn = get_connection()
     try:
-        # Check if user exists
+        if not username.isalnum():
+            return {"error": "Username must be alphanumeric only."}
+
         exists = conn.execute("SELECT 1 FROM system_app.users WHERE username=?", [username]).fetchone()
         if exists:
             return {"error": "User already exists"}
         
-        # FIX: We specify (username, password) and leave out created_at
-        # The DB will now auto-fill created_at with the current UTC time
-        conn.execute(
-            "INSERT INTO system_app.users (username, password) VALUES (?, ?)", 
-            [username, password]
-        )
+        # Insert (Letting DB handle created_at)
+        conn.execute("INSERT INTO system_app.users (username, password) VALUES (?, ?)", [username, password])
         
-        # Create User Schema
+        # Create Schema
         safe_schema = f"user_{username}"
         conn.execute(f"CREATE SCHEMA IF NOT EXISTS {safe_schema};")
         
@@ -81,30 +77,6 @@ def login_user(username, password):
         conn.close()
     return None
 
-def run_sql_query(username, sql):
-    conn = get_connection()
-    try:
-        # Context Switching:
-        # If admin, they run against everything. 
-        # If user, we force them into their schema so 'CREATE TABLE x' -> 'user_john.x'
-        if username != "admin":
-            safe_schema = f"user_{username}"
-            conn.execute(f"USE {safe_schema};")
-
-        result = conn.execute(sql)
-        
-        if result.description:  # SELECT query
-            columns = [desc[0] for desc in result.description]
-            rows = result.fetchall()
-            return {"type": "table", "columns": columns, "rows": rows}
-        else:
-            # DuckDB returns None for total_changes sometimes in cloud, handling gracefully
-            return {"type": "message", "message": "Query executed successfully."}
-    except Exception as e:
-        return {"type": "error", "message": str(e)}
-    finally:
-        conn.close()
-
 def get_all_users():
     conn = get_connection()
     try:
@@ -116,7 +88,6 @@ def get_all_users():
         conn.close()
 
 def delete_user(username):
-    """Deletes user record and drops their schema."""
     conn = get_connection()
     try:
         conn.execute("DELETE FROM system_app.users WHERE username=?", [username])
@@ -128,12 +99,76 @@ def delete_user(username):
         conn.close()
 
 # -------------------------------
-# Streamlit UI
+# 🔒 SECURITY GUARDRAILS
+# -------------------------------
+def validate_sql_permissions(sql, username):
+    """
+    Prevents schema leaks via metadata commands.
+    """
+    if username == "admin":
+        return True, ""
+
+    sql_lower = sql.lower()
+
+    # 1. Block Global Metadata Lookups
+    if "show all tables" in sql_lower:
+        return False, "🚫 'SHOW ALL TABLES' is restricted. Use 'SHOW TABLES' to see your own tables."
+    
+    # 2. Block Information Schema (The "Phonebook" of the DB)
+    if "information_schema" in sql_lower:
+        return False, "🚫 Access to 'information_schema' is restricted for security."
+
+    # 3. Block System App (Passwords)
+    if "system_app" in sql_lower:
+        return False, "🚫 Access to 'system_app' is forbidden."
+
+    # 4. Block Other Users' Schemas
+    # Regex finds: "user_something"
+    schema_references = re.findall(r'\buser_(\w+)\b', sql_lower)
+    for ref_user in schema_references:
+        if ref_user != username.lower():
+            return False, f"🚫 Security Violation: You cannot access 'user_{ref_user}' data."
+
+    # 5. Block Schema Destruction
+    if "drop schema" in sql_lower:
+        return False, "🚫 Dropping schemas is not allowed."
+
+    return True, ""
+
+def run_sql_query(username, sql):
+    # 1. Security Check
+    is_valid, msg = validate_sql_permissions(sql, username)
+    if not is_valid:
+        return {"type": "error", "message": msg}
+
+    conn = get_connection()
+    try:
+        # 2. Force Context (The "Wall")
+        if username != "admin":
+            safe_schema = f"user_{username}"
+            conn.execute(f"USE {safe_schema};")
+
+        # 3. Execute
+        result = conn.execute(sql)
+        
+        if result.description:
+            columns = [desc[0] for desc in result.description]
+            rows = result.fetchall()
+            return {"type": "table", "columns": columns, "rows": rows}
+        else:
+            return {"type": "message", "message": "Query executed successfully."}
+    except Exception as e:
+        return {"type": "error", "message": str(e)}
+    finally:
+        conn.close()
+
+# -------------------------------
+# Streamlit UI (STRICTLY PRESERVED)
 # -------------------------------
 st.set_page_config(page_title="SQL Lab", page_icon="🔬", layout="wide")
 st.title("🧪 SQL Lab")
 
-# Initialize DB structure once
+# Initialize DB once
 if "db_init_done" not in st.session_state:
     init_db()
     st.session_state["db_init_done"] = True
@@ -165,7 +200,7 @@ if st.session_state["token"] is None:
                 st.session_state["username"] = username
                 st.session_state["token"] = True
                 st.success(f"Logged in as {username}")
-                st.rerun() # Added rerun for smoother state transition
+                st.rerun()
             else:
                 st.error("Invalid credentials")
 
@@ -187,7 +222,7 @@ if st.session_state["token"] is None:
                 st.session_state["username"] = "admin"
                 st.session_state["token"] = True
                 st.success("Admin logged in successfully!")
-                st.rerun() # Added rerun
+                st.rerun()
             else:
                 st.error("Invalid admin token")
 
@@ -223,10 +258,9 @@ if st.session_state["token"]:
                 if st.button("Delete User"):
                     if confirm:
                         try:
-                            # UPDATED: Use delete_user helper instead of os.remove
                             delete_user(user_to_delete)
                             st.success(f"User `{user_to_delete}` deleted successfully!")
-                            st.rerun()  # 🔥 Force refresh so user list updates
+                            st.rerun()
                         except Exception as e:
                             st.error(f"Error deleting user: {str(e)}")
                     else:
@@ -237,7 +271,6 @@ if st.session_state["token"]:
 
         with tabs[2]:
             st.write("Execute SQL on admin database:")
-            # Admin SQL DB - Logic simplified as admin accesses the whole MD instance
             ace_themes = ["dracula", "monokai", "github", "tomorrow", "twilight", "xcode", "solarized_dark", "solarized_light", "terminal"]
             selected_theme = st.selectbox("Select ACE Editor Theme", ace_themes)
             sql_query = st_ace(
@@ -254,6 +287,7 @@ if st.session_state["token"]:
                 placeholder="Write SQL here..."
             )
             if sql_query.strip() and sql_query != st.session_state.get("last_executed_sql"):
+                # Admin runs without strict user checks
                 result = run_sql_query("admin", sql_query)
                 st.session_state["last_executed_sql"] = sql_query
                 if result["type"] == "table":
@@ -269,7 +303,6 @@ if st.session_state["token"]:
         st.subheader(f"User Dashboard - {username}")
         st.write(f"Hello {username}! Practice SQL below:")
 
-        # ACE editor for SQL queries
         ace_themes = ["dracula", "monokai", "github", "tomorrow", "twilight", "xcode", "solarized_dark", "solarized_light", "terminal"]
         selected_theme = st.selectbox("Select ACE Editor Theme", ace_themes)
         sql_query = st_ace(
